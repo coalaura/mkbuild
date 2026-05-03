@@ -1,0 +1,186 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  project_name: << .Name >>
+
+jobs:
+  build:
+<<- if .CGO >>
+    runs-on: ${{ matrix.runner }}
+<<- else >>
+    runs-on: ubuntu-latest
+<<- end >>
+    strategy:
+      matrix:
+        include:
+<<- if .CGO >>
+          - goos: linux
+            goarch: amd64
+            zig_target: x86_64-linux-musl
+            runner: ubuntu-latest
+          - goos: linux
+            goarch: arm64
+            zig_target: aarch64-linux-musl
+            runner: ubuntu-latest
+          - goos: windows
+            goarch: amd64
+            zig_target: x86_64-windows-gnu
+            runner: ubuntu-latest
+          - goos: windows
+            goarch: arm64
+            zig_target: aarch64-windows-gnu
+            runner: ubuntu-latest
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+<<- else >>
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+<<- end >>
+      fail-fast: false
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+
+<<- if .CGO >>
+    - name: Set up Zig
+      if: matrix.zig_target != ''
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+<<- end >>
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: 'go.mod'
+<<- if not .CGO >>
+        cache: false
+<<- end >>
+<<- if not .CGO >>
+
+    - name: Cache Go build and modules
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ matrix.goos }}-${{ matrix.goarch }}-${{ hashFiles('**/go.sum', '**/go.mod') }}
+        restore-keys: |
+          ${{ runner.os }}-go-${{ matrix.goos }}-${{ matrix.goarch }}-
+<<- end >>
+
+    - name: Build
+      shell: bash
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+<<- if .CGO >>
+        CGO_ENABLED: 1
+<<- else >>
+        CGO_ENABLED: 0
+<<- end >>
+      run: |
+        mkdir -p bin
+        EXT=""
+        LDFLAGS=""
+
+        if [[ "$GOOS" == "windows" ]]; then
+          EXT=".exe"
+        fi
+
+<<- if .CGO >>
+        if [[ -n "${{ matrix.zig_target }}" ]]; then
+          export CC="zig cc -target ${{ matrix.zig_target }}"
+          export CXX="zig c++ -target ${{ matrix.zig_target }}"
+
+          if [[ "${{ matrix.zig_target }}" == *"musl"* ]]; then
+            LDFLAGS="-linkmode external -extldflags '-static'"
+          fi
+        elif [[ "$GOOS" == "darwin" ]]; then
+          LDFLAGS="-extldflags=-Wl,-no_warn_duplicate_libraries"
+        fi
+<<- end >>
+
+        go build \
+          -trimpath \
+          -buildvcs=false \
+          -ldflags "-s -w -X 'main.Version=${{ github.ref_name }}' $LDFLAGS" \
+          -o "bin/${{ env.project_name }}-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" << .MainPath >>
+<<- if .Archive >>
+
+    - name: Package Archive
+      shell: bash
+      run: |
+        cd bin
+        BINARY="${{ env.project_name }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+        if [[ "${{ matrix.goos }}" == "windows" ]]; then
+          BINARY="${BINARY}.exe"
+          zip "${{ env.project_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip" "$BINARY"
+        else
+          tar czf "${{ env.project_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" "$BINARY"
+        fi
+<<- end >>
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: ${{ env.project_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+<<- if .Archive >>
+        path: |
+          bin/*.tar.gz
+          bin/*.zip
+<<- else >>
+        path: bin/*
+<<- end >>
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download Artifacts
+      uses: actions/download-artifact@v8
+      with:
+        pattern: ${{ env.project_name }}_*
+        path: bin
+        merge-multiple: true
+<<- if .Checksums >>
+
+    - name: Generate Checksums
+      run: |
+        cd bin
+        sha256sum * > checksums-sha256.txt
+<<- end >>
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: bin/*
+        name: "Release ${{ github.ref_name }}"
+<<- if .Draft >>
+        draft: true
+<<- end >>
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
